@@ -1,0 +1,20 @@
+{
+  "name": "sales-message-logger",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "setup:feishu": "powershell -ExecutionPolicy Bypass -File scripts/setup-feishu.ps1",
+    "start:feishu": "powershell -ExecutionPolicy Bypass -File scripts/start-feishu.ps1",
+    "test:feishu": "powershell -ExecutionPolicy Bypass -File scripts/test-feishu.ps1",
+    "start:lark": "powershell -ExecutionPolicy Bypass -File scripts/start-lark.ps1",
+    "test:lark": "powershell -ExecutionPolicy Bypass -File scripts/test-lark.ps1",
+    "build:installer": "powershell -ExecutionPolicy Bypass -File installer/build-installer.ps1",
+    "lark:version": "lark-cli.cmd --version",
+    "lark:doctor": "lark-cli.cmd doctor"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

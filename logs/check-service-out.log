@@ -1,0 +1,6 @@
+[sales-message-logger] Loaded 45 dedupe keys for 2026-05-06
+Sales Message Logger listening on http://127.0.0.1:3107
+Setup wizard available at http://127.0.0.1:3107/setup
+Lark CLI disabled
+Lark aggregate window 5000ms
+Feishu webhook disabled

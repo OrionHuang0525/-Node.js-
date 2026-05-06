@@ -1,0 +1,8 @@
+node_modules/
+logs/*.txt
+logs/dedupe-*.json
+logs/*.tmp
+config/feishu.local.env
+config/lark.local.env
+config/runtime.local.json
+dist/
