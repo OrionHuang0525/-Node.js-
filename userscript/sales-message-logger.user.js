@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Sales Consultation Local Logger
 // @namespace    sanstar.local
-// @version      1.0.0
+// @version      1.1.0
 // @description  监听售后待回复消息，并写入本机 TXT 日志
 // @match        https://shengji.lingdongsz.com/uranus/*
 // @run-at       document-idle
@@ -20,13 +20,17 @@
     targetHash: "/afterMessage/salesConsultation",
     logApi: "http://127.0.0.1:3107/log-message",
     healthApi: "http://127.0.0.1:3107/health",
+    replyPollApi: "http://127.0.0.1:3107/reply-actions/poll?source=sales-consultation",
+    replyReportApiBase: "http://127.0.0.1:3107/reply-actions",
     scanDelayMs: 3000,
     restartDelayMs: 1500,
+    replyPollIntervalMs: 5000,
     minTextLength: 8,
     maxTextLength: 50000,
     dedupeStorageKey: "sales_message_logger_sent_keys_v1",
     maxDedupeKeys: 1000,
     logExistingOnFirstRun: false,
+    stateScanIntervalMs: 10000,
     debug: true
   };
 
@@ -76,10 +80,15 @@
   let isStarting = false;
   let runToken = 0;
   let currentChatContext = null;
+  let orderStateScanTimer = null;
+  let replyPollTimer = null;
+  let activeReplyApprovalId = "";
+  let replyConfirmOverlay = null;
 
   const debugWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
 
   const observerAddedOrderNodes = new WeakSet();
+  const orderStateMap = new Map();
   let sentKeyList = [];
   let sentKeys = new Set();
   let dedupeStorageLoaded = false;
@@ -134,6 +143,44 @@
     }
 
     throw new Error("GM_xmlhttpRequest is not available");
+  }
+
+  function gmJsonRequest(details) {
+    return new Promise((resolve, reject) => {
+      try {
+        gmRequest({
+          method: details.method || "GET",
+          url: details.url,
+          headers: details.headers || {},
+          data: details.data,
+          timeout: details.timeout || 10000,
+          onload(response) {
+            let parsed = null;
+
+            try {
+              parsed = JSON.parse(response.responseText || "{}");
+            } catch (error) {
+              parsed = null;
+            }
+
+            if (response.status >= 200 && response.status < 300) {
+              resolve(parsed || {});
+              return;
+            }
+
+            reject(new Error((parsed && parsed.message) || `HTTP ${response.status}`));
+          },
+          onerror(error) {
+            reject(error instanceof Error ? error : new Error("GM request error"));
+          },
+          ontimeout() {
+            reject(new Error("GM request timeout"));
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
+    });
   }
 
   function isTargetPage() {
@@ -305,6 +352,49 @@
     }
 
     return Boolean(orderInfo.unread || observerAddedOrderNodes.has(li));
+  }
+
+  function getOrderStateKey(orderInfo) {
+    return orderInfo.orderNo || orderInfo.orderDomId || hashString(orderInfo.rawText || "");
+  }
+
+  function getOrderState(orderInfo) {
+    return {
+      key: getOrderStateKey(orderInfo),
+      unread: Boolean(orderInfo.unread),
+      rawHash: hashString(orderInfo.rawText || ""),
+      rawLength: String(orderInfo.rawText || "").length
+    };
+  }
+
+  function rememberOrderState(orderInfo) {
+    const state = getOrderState(orderInfo);
+
+    if (state.key) {
+      orderStateMap.set(state.key, state);
+    }
+
+    return state;
+  }
+
+  function shouldLogOrderStateChange(orderInfo) {
+    if (!orderInfo || !orderInfo.unread) {
+      return false;
+    }
+
+    const state = getOrderState(orderInfo);
+    const previous = state.key ? orderStateMap.get(state.key) : null;
+
+    if (!previous) {
+      rememberOrderState(orderInfo);
+      return false;
+    }
+
+    const becameUnread = !previous.unread && state.unread;
+    const unreadTextChanged = previous.unread && state.unread && previous.rawHash !== state.rawHash;
+
+    rememberOrderState(orderInfo);
+    return becameUnread || unreadTextChanged;
   }
 
   function getCurrentChatContext() {
@@ -550,6 +640,284 @@
     }
   }
 
+  function isVisibleElement(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && rect.width > 0
+      && rect.height > 0;
+  }
+
+  function findReplyEditor() {
+    const selectors = [
+      ".consultation-right textarea:not([readonly])",
+      ".consultation-right .el-textarea__inner:not([readonly])",
+      ".consultation-right [contenteditable='true']",
+      ".consultation-right input:not([readonly])",
+      "textarea:not([readonly])",
+      "[contenteditable='true']"
+    ];
+
+    for (const selector of selectors) {
+      const nodes = Array.from(document.querySelectorAll(selector));
+      const node = nodes.find((item) => isVisibleElement(item) && !item.disabled);
+
+      if (node) {
+        return node;
+      }
+    }
+
+    return null;
+  }
+
+  function findSendButton() {
+    const buttons = Array.from(document.querySelectorAll(".consultation-right button, .consultation-right .el-button, button"));
+    return buttons.find((button) => {
+      const text = normalizeText(button.innerText || button.textContent);
+      const disabled = button.disabled
+        || button.getAttribute("aria-disabled") === "true"
+        || button.classList.contains("is-disabled");
+
+      return isVisibleElement(button)
+        && !disabled
+        && (text === "发送" || text === "发送且已读");
+    }) || null;
+  }
+
+  function setEditorValue(editor, text) {
+    const value = String(text || "");
+
+    editor.focus();
+
+    if (editor.isContentEditable) {
+      editor.textContent = value;
+      editor.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: value
+      }));
+      editor.dispatchEvent(new Event("change", { bubbles: true }));
+      return;
+    }
+
+    const prototype = editor.tagName === "TEXTAREA"
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(editor, value);
+    } else {
+      editor.value = value;
+    }
+
+    editor.dispatchEvent(new Event("input", { bubbles: true }));
+    editor.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  function reportReplyAction(approvalId, status, detail, error) {
+    return gmJsonRequest({
+      method: "POST",
+      url: `${CONFIG.replyReportApiBase}/${encodeURIComponent(approvalId)}/report`,
+      headers: {
+        "Content-Type": "application/json"
+      },
+      data: JSON.stringify({
+        status,
+        pageUrl: location.href,
+        detail: detail || "",
+        error: error || ""
+      }),
+      timeout: 10000
+    }).catch((requestError) => {
+      console.warn(`[${LOG_PREFIX}] reply action report failed`, status, requestError);
+    });
+  }
+
+  function activeOrderMatchesReplyAction(action) {
+    const activeLi = document.querySelector("li.orders-body.active-option");
+
+    if (!activeLi) {
+      return {
+        ok: false,
+        reason: "active-order-not-found"
+      };
+    }
+
+    const orderInfo = parseOrderItem(activeLi);
+    const orderMatches = action.orderNo && orderInfo.orderNo === action.orderNo;
+    const actionCustomer = normalizeNameForCompare(action.customerName);
+    const orderCustomer = normalizeNameForCompare(orderInfo.customerName);
+    const customerMatches = !actionCustomer || !orderCustomer || actionCustomer === orderCustomer;
+
+    if (!orderMatches) {
+      return {
+        ok: false,
+        reason: `order-mismatch current=${orderInfo.orderNo || "-"} expected=${action.orderNo || "-"}`
+      };
+    }
+
+    if (!customerMatches) {
+      return {
+        ok: false,
+        reason: `customer-mismatch current=${orderInfo.customerName || "-"} expected=${action.customerName || "-"}`
+      };
+    }
+
+    return {
+      ok: true,
+      orderInfo
+    };
+  }
+
+  function closeReplyOverlay() {
+    if (replyConfirmOverlay && replyConfirmOverlay.parentNode) {
+      replyConfirmOverlay.parentNode.removeChild(replyConfirmOverlay);
+    }
+
+    replyConfirmOverlay = null;
+    activeReplyApprovalId = "";
+  }
+
+  function showReplyConfirmOverlay(action, editor, sendButton) {
+    closeReplyOverlay();
+
+    const overlay = document.createElement("div");
+    overlay.id = "sales-message-logger-reply-confirm";
+    overlay.innerHTML = `
+      <div class="sml-backdrop"></div>
+      <div class="sml-panel">
+        <h3>确认发送售后回复</h3>
+        <p>订单编号：${action.orderNo || "-"}</p>
+        <p>客户名：${action.customerName || "-"}</p>
+        <label>建议回复，可在发送前修改</label>
+        <textarea class="sml-reply-text"></textarea>
+        <div class="sml-error" aria-live="polite"></div>
+        <div class="sml-actions">
+          <button type="button" class="sml-send">确认发送</button>
+          <button type="button" class="sml-cancel">取消</button>
+        </div>
+      </div>
+    `;
+
+    const style = document.createElement("style");
+    style.textContent = `
+      #sales-message-logger-reply-confirm { position: fixed; inset: 0; z-index: 2147483647; font-family: "Microsoft YaHei", Arial, sans-serif; }
+      #sales-message-logger-reply-confirm .sml-backdrop { position: absolute; inset: 0; background: rgba(15, 23, 42, .38); }
+      #sales-message-logger-reply-confirm .sml-panel { position: absolute; right: 24px; bottom: 24px; width: min(560px, calc(100vw - 48px)); background: #fff; border: 1px solid #d8dee8; border-radius: 8px; box-shadow: 0 20px 50px rgba(15,23,42,.22); padding: 18px; color: #1f2937; }
+      #sales-message-logger-reply-confirm h3 { margin: 0 0 10px; font-size: 18px; }
+      #sales-message-logger-reply-confirm p { margin: 4px 0; font-size: 14px; }
+      #sales-message-logger-reply-confirm label { display: block; margin: 12px 0 6px; font-weight: 600; font-size: 14px; }
+      #sales-message-logger-reply-confirm textarea { width: 100%; min-height: 150px; resize: vertical; border: 1px solid #cfd6e4; border-radius: 6px; padding: 10px; font-size: 14px; line-height: 1.5; }
+      #sales-message-logger-reply-confirm .sml-error { min-height: 20px; margin-top: 8px; color: #b42318; font-size: 13px; }
+      #sales-message-logger-reply-confirm .sml-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 12px; }
+      #sales-message-logger-reply-confirm button { min-height: 36px; padding: 0 14px; border-radius: 6px; border: 1px solid #1664ff; cursor: pointer; }
+      #sales-message-logger-reply-confirm .sml-send { background: #1664ff; color: #fff; }
+      #sales-message-logger-reply-confirm .sml-cancel { background: #fff; color: #1664ff; }
+    `;
+    overlay.appendChild(style);
+    document.body.appendChild(overlay);
+
+    const textarea = overlay.querySelector(".sml-reply-text");
+    const errorNode = overlay.querySelector(".sml-error");
+    textarea.value = action.suggestedReply || "";
+    textarea.focus();
+
+    overlay.querySelector(".sml-cancel").addEventListener("click", () => {
+      reportReplyAction(action.approvalId, "CANCELED", "cancelled in page overlay");
+      closeReplyOverlay();
+    });
+
+    overlay.querySelector(".sml-send").addEventListener("click", () => {
+      const finalText = textarea.value.trim();
+
+      if (!finalText) {
+        errorNode.textContent = "回复内容不能为空。";
+        return;
+      }
+
+      const match = activeOrderMatchesReplyAction(action);
+
+      if (!match.ok) {
+        errorNode.textContent = `当前选中订单不匹配，已阻止发送：${match.reason}`;
+        return;
+      }
+
+      setEditorValue(editor, finalText);
+      sendButton.click();
+      reportReplyAction(action.approvalId, "SENT", "sent after page second confirmation");
+      closeReplyOverlay();
+    });
+
+    replyConfirmOverlay = overlay;
+  }
+
+  async function handleApprovedReplyAction(action) {
+    if (!isTargetPage() || activeReplyApprovalId || replyConfirmOverlay) {
+      return;
+    }
+
+    const match = activeOrderMatchesReplyAction(action);
+
+    if (!match.ok) {
+      debugLog("approved reply waiting for matching active order", action.approvalId, match.reason);
+      return;
+    }
+
+    const editor = findReplyEditor();
+    const sendButton = findSendButton();
+
+    if (!editor || !sendButton) {
+      await reportReplyAction(action.approvalId, "FAILED", "", `reply editor or send button not found. editor=${Boolean(editor)} sendButton=${Boolean(sendButton)}`);
+      return;
+    }
+
+    activeReplyApprovalId = action.approvalId;
+    setEditorValue(editor, action.suggestedReply || "");
+    await reportReplyAction(action.approvalId, "FILLED_DRAFT", "draft filled, waiting for page second confirmation");
+    showReplyConfirmOverlay(action, editor, sendButton);
+  }
+
+  async function pollReplyActions() {
+    if (!isTargetPage()) {
+      return;
+    }
+
+    try {
+      const data = await gmJsonRequest({
+        method: "GET",
+        url: CONFIG.replyPollApi,
+        timeout: 8000
+      });
+
+      const actions = Array.isArray(data.actions) ? data.actions : [];
+
+      if (!actions.length) {
+        return;
+      }
+
+      await handleApprovedReplyAction(actions[0]);
+    } catch (error) {
+      debugLog("reply action poll failed", error.message || error);
+    }
+  }
+
+  function startReplyActionPollTimer() {
+    if (replyPollTimer) {
+      clearInterval(replyPollTimer);
+    }
+
+    replyPollTimer = setInterval(() => {
+      pollReplyActions();
+    }, CONFIG.replyPollIntervalMs);
+    pollReplyActions();
+  }
+
   function processOrderItem(li, options) {
     const settings = options || {};
     const orderInfo = parseOrderItem(li);
@@ -569,6 +937,7 @@
       const suffix = `debug-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       message.id = `${message.id}-${suffix}`;
       message.extra.debugResend = true;
+      message.extra.debugReason = settings.reason || "resend";
       dedupeKey = `${dedupeKey}|${suffix}`;
     }
 
@@ -595,6 +964,7 @@
         return;
       }
 
+      rememberOrderState(orderInfo);
       const message = buildMessage(orderInfo, li);
       const dedupeKey = createDedupeKey(message);
       trackedCount += 1;
@@ -632,27 +1002,104 @@
     return items;
   }
 
+  function collectOrderItemFromMutationTarget(target) {
+    if (!(target instanceof Element)) {
+      return null;
+    }
+
+    if (target.matches("li.orders-body")) {
+      return target;
+    }
+
+    return target.closest("li.orders-body");
+  }
+
+  function processOrderStateChange(li, reason) {
+    const orderInfo = parseOrderItem(li);
+
+    if (!isTrackableOrderItem(orderInfo, li)) {
+      return;
+    }
+
+    if (!shouldLogOrderStateChange(orderInfo)) {
+      return;
+    }
+
+    debugLog("order state changed", reason, orderInfo.orderNo, orderInfo.customerName);
+    observerAddedOrderNodes.add(li);
+    processOrderItem(li, {
+      forceLog: true,
+      ignoreDedupe: true,
+      resend: true,
+      reason: reason || "state-change"
+    });
+  }
+
+  function scanOrderStateChanges(reason) {
+    const orderWrap = document.querySelector("ul.order-wrap");
+
+    if (!orderWrap) {
+      return;
+    }
+
+    Array.from(orderWrap.querySelectorAll("li.orders-body")).forEach((li) => {
+      processOrderStateChange(li, reason || "periodic-scan");
+    });
+  }
+
+  function startOrderStateScanTimer() {
+    if (orderStateScanTimer) {
+      clearInterval(orderStateScanTimer);
+    }
+
+    orderStateScanTimer = setInterval(() => {
+      if (!isTargetPage()) {
+        return;
+      }
+
+      scanOrderStateChanges("periodic-scan");
+    }, CONFIG.stateScanIntervalMs);
+  }
+
   function startOrderListObserver(orderWrap) {
     if (orderListObserver) {
       orderListObserver.disconnect();
     }
 
     orderListObserver = new MutationObserver((mutations) => {
+      const changedItems = new Set();
+
       mutations.forEach((mutation) => {
         mutation.addedNodes.forEach((node) => {
           collectOrderItemsFromAddedNode(node).forEach((li) => {
             observerAddedOrderNodes.add(li);
+            rememberOrderState(parseOrderItem(li));
             processOrderItem(li);
           });
         });
+
+        if (mutation.type === "attributes" || mutation.type === "characterData" || mutation.type === "childList") {
+          const targetItem = collectOrderItemFromMutationTarget(mutation.target);
+
+          if (targetItem) {
+            changedItems.add(targetItem);
+          }
+        }
+      });
+
+      changedItems.forEach((li) => {
+        processOrderStateChange(li, "mutation");
       });
     });
 
     orderListObserver.observe(orderWrap, {
       childList: true,
-      subtree: false
+      subtree: true,
+      attributes: true,
+      characterData: true
     });
 
+    startOrderStateScanTimer();
     console.log(`[${LOG_PREFIX}] found ul.order-wrap`);
   }
 
@@ -745,6 +1192,11 @@
       activeOrderCount: document.querySelectorAll("ul.order-wrap li.orders-body.active-option").length,
       dedupeStorageLoaded,
       sentKeyCount: sentKeys.size,
+      trackedOrderStateCount: orderStateMap.size,
+      hasOrderStateScanTimer: Boolean(orderStateScanTimer),
+      hasReplyPollTimer: Boolean(replyPollTimer),
+      activeReplyApprovalId,
+      hasReplyConfirmOverlay: Boolean(replyConfirmOverlay),
       locationHref: location.href
     };
   }
@@ -809,6 +1261,8 @@
     scanCurrentList: debugScanCurrentList,
     resendCurrentList: () => debugScanCurrentList({ force: true, resend: true }),
     clearLocalDedupe,
+    scanOrderStateChanges: () => scanOrderStateChanges("debug-state-scan"),
+    pollReplyActions,
     start: startIfTargetPage,
     stop: stopObservers
   };
@@ -857,6 +1311,7 @@
         startChatHistoryObserver(chatHistory);
       }
 
+      startReplyActionPollTimer();
       isStarted = true;
       console.log(`${LOG_PREFIX} started`);
     } finally {
@@ -877,6 +1332,17 @@
       chatHistoryObserver = null;
     }
 
+    if (orderStateScanTimer) {
+      clearInterval(orderStateScanTimer);
+      orderStateScanTimer = null;
+    }
+
+    if (replyPollTimer) {
+      clearInterval(replyPollTimer);
+      replyPollTimer = null;
+    }
+
+    closeReplyOverlay();
     isStarted = false;
     isStarting = false;
     currentChatContext = null;

@@ -2,7 +2,10 @@ node_modules/
 logs/*.txt
 logs/dedupe-*.json
 logs/*.tmp
+logs/*.log
+logs/pending-claude-queue.json
 config/feishu.local.env
 config/lark.local.env
 config/runtime.local.json
 dist/
+.playwright-mcp/

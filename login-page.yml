@@ -1,0 +1,35 @@
+- generic [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - generic [ref=e7]:
+          - img [ref=e8]
+          - heading "- 领东科技" [level=3] [ref=e9]
+        - generic [ref=e10]:
+          - heading "欢迎回来" [level=1] [ref=e11]
+          - heading "蓝鲸BI，跨境电商平台数据分析专家" [level=3] [ref=e12]
+        - paragraph [ref=e13]: 用户账号
+        - generic [ref=e16]:
+          - textbox "请输入用户账号" [ref=e17]: orion
+          - generic [ref=e19]: 
+        - paragraph [ref=e20]: 密码
+        - generic [ref=e23]:
+          - textbox "请输入密码" [ref=e24]: "123456"
+          - generic [ref=e26]: 
+          - generic:
+            - img [ref=e28] [cursor=pointer]
+            - text: 
+        - generic [ref=e29]:
+          - generic [ref=e31] [cursor=pointer]:
+            - checkbox [checked]
+          - text: 您已阅读并同意
+          - link "《服务协议》" [ref=e33] [cursor=pointer]:
+            - /url: "#"
+          - link "忘记密码?" [ref=e34] [cursor=pointer]:
+            - /url: "#"
+        - button "登 录" [ref=e37] [cursor=pointer]:
+          - generic [ref=e38]: 登 录
+      - paragraph [ref=e40] [cursor=pointer]: 首次使用，请您点击添加客服微信
+      - img [ref=e42] [cursor=pointer]
+    - generic [ref=e43]: Copyright ⓒ 2021-2025 www.lingdongsz.com 深圳领东时代科技有限公司 粤ICP备2022002680号-1 LJBIV136R0509
+  - text: 
